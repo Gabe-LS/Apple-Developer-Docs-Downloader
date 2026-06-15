@@ -172,7 +172,9 @@ def render_content_block(block, depth=0):
         lines.append(render_inline(block.get("inlineContent", [])))
         lines.append("")
     elif t == "codeListing":
-        lang = block.get("syntax", "swift")
+        # Strip anything that isn't a bare language token so an unexpected syntax
+        # value (spaces, backticks) can't malform the fence info string.
+        lang = re.sub(r"[^A-Za-z0-9_+.-]", "", block.get("syntax", "swift")) or "swift"
         code = "\n".join(block.get("code", []))
         # Pick a fence longer than the longest backtick run in the code so a
         # snippet that itself contains ``` can't close the block early.
@@ -510,7 +512,11 @@ def sanitize_filename(name):
     # (APFS, ext4) cap names at 255 bytes and one character can be several bytes.
     encoded = name.encode("utf-8")
     if len(encoded) > 200:
-        return encoded[:200].decode("utf-8", "ignore")
+        # Re-strip after truncation: dropping a partial multibyte sequence (or
+        # cutting mid-name) can leave a trailing/leading "._-" or an empty
+        # string, both of which make awkward or invalid filenames.
+        truncated = encoded[:200].decode("utf-8", "ignore").strip(".-_")
+        return truncated or "untitled"
     return name
 
 
@@ -713,19 +719,27 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                 visited.add(p)
                 queue.append(p)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        # Keep one in-flight task per worker at all times. A per-batch barrier
-        # (submit `workers` pages, then wait for the whole batch before
-        # refilling) leaves workers idle whenever a single page is slow — a
-        # retrying page can block ~100s on backoff plus timeouts — so we refill
-        # continuously as individual futures complete instead.
-        in_flight = {}
+    # Manage the executor explicitly rather than via `with`: its __exit__ calls
+    # shutdown(wait=True), which on Ctrl-C/SIGTERM blocks until every in-flight
+    # request finishes (a retrying page can take ~100s) before main()'s finally
+    # can persist state — risking lost progress past a CI/container termination
+    # grace period. Returning without waiting lets save_state() run before the
+    # at-exit thread join, so progress is flushed promptly.
+    executor = ThreadPoolExecutor(max_workers=workers)
 
-        def fill():
-            while queue and len(in_flight) < workers:
-                p = queue.popleft()
-                in_flight[executor.submit(process_page, p)] = p
+    # Keep one in-flight task per worker at all times. A per-batch barrier
+    # (submit `workers` pages, then wait for the whole batch before refilling)
+    # leaves workers idle whenever a single page is slow — a retrying page can
+    # block ~100s on backoff plus timeouts — so we refill continuously as
+    # individual futures complete instead.
+    in_flight = {}
 
+    def fill():
+        while queue and len(in_flight) < workers:
+            p = queue.popleft()
+            in_flight[executor.submit(process_page, p)] = p
+
+    try:
         fill()
         while in_flight:
             done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
@@ -761,6 +775,11 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                         flush=True,
                     )
             fill()
+    finally:
+        # Don't block on in-flight (possibly slow/retrying) requests on
+        # shutdown; cancel anything still queued so main()'s finally can save
+        # state promptly. cancel_futures requires Python 3.9+.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _atomic_write(path, text):
