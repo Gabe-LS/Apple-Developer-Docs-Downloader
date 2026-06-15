@@ -64,9 +64,9 @@ def fetch_json(path, retry=0):
         if e.code == 404:
             return None
         if retry < MAX_RETRIES:
-            wait = 2**retry
-            print(f"  HTTP {e.code} for {url}, retrying in {wait}s...")
-            time.sleep(wait)
+            delay = 2**retry
+            print(f"  HTTP {e.code} for {url}, retrying in {delay}s...")
+            time.sleep(delay)
             return fetch_json(path, retry + 1)
         print(f"  FAILED: HTTP {e.code} for {url}")
         with lock:
@@ -74,9 +74,9 @@ def fetch_json(path, retry=0):
         return None
     except Exception as e:
         if retry < MAX_RETRIES:
-            wait = 2**retry
-            print(f"  Error for {url}: {e}, retrying in {wait}s...")
-            time.sleep(wait)
+            delay = 2**retry
+            print(f"  Error for {url}: {e}, retrying in {delay}s...")
+            time.sleep(delay)
             return fetch_json(path, retry + 1)
         print(f"  FAILED: {e} for {url}")
         with lock:
@@ -561,13 +561,15 @@ def discover_identifier_prefix(data):
 
 def is_same_framework_identifier(ident):
     """Check if an identifier belongs to the framework we're crawling."""
-    if DOC_IDENTIFIER_PREFIX:
-        return ident.startswith(DOC_IDENTIFIER_PREFIX)
-    # Prefix discovery failed (unexpected root page or API change). Rather than
-    # accepting every doc:// identifier — which would let the crawler wander out
-    # of the requested framework into Apple's heavily cross-linked docs — match
-    # the path segment after /documentation/ against the target framework.
+    # The discovered prefix is only bundle-scoped, and several frameworks can
+    # share one bundle id (e.g. "doc://com.apple.documentation/..."), so a
+    # prefix match alone can let the crawler wander into sibling frameworks
+    # through Apple's heavy cross-linking. Always confirm the path segment right
+    # after /documentation/ matches the target framework — the same invariant
+    # get_output_path/strip_framework_prefix already rely on.
     if not ident.startswith("doc://") or "/documentation/" not in ident:
+        return False
+    if DOC_IDENTIFIER_PREFIX and not ident.startswith(DOC_IDENTIFIER_PREFIX):
         return False
     idx = ident.find("/documentation/")
     after = ident[idx + len("/documentation/") :].lower()
@@ -698,8 +700,7 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                             queue.append(child)
 
                 if count % 50 == 0:
-                    with lock:
-                        save_state()
+                    save_state()
                     print(
                         f"  [{count} pages downloaded, ~{len(queue)} in queue]",
                         flush=True,
@@ -720,6 +721,10 @@ def _atomic_write(path, text):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+        # mkstemp creates the file 0600; widen to 0644 so downloaded docs (and
+        # the resume/manifest files) are readable by other users like normal
+        # files, instead of owner-only.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -730,15 +735,21 @@ def _atomic_write(path, text):
 
 
 def save_state():
-    state = {
-        "visited": list(visited),
-        "failed": failed,
-        "page_count": page_count,
-        "framework": FRAMEWORK_API_PATH,
-        "identifier_prefix": DOC_IDENTIFIER_PREFIX,
-    }
+    # Snapshot shared state under the lock, then serialize and write to disk
+    # outside it. Holding `lock` across two atomic file writes would stall every
+    # worker (they all need it to record results and enqueue children) for the
+    # full duration of two JSON dumps on each 50-page checkpoint.
+    with lock:
+        state = {
+            "visited": list(visited),
+            "failed": list(failed),
+            "page_count": page_count,
+            "framework": FRAMEWORK_API_PATH,
+            "identifier_prefix": DOC_IDENTIFIER_PREFIX,
+        }
+        manifest_snapshot = dict(manifest)
     _atomic_write(STATE_FILE, json.dumps(state, indent=2))
-    _atomic_write(MANIFEST_FILE, json.dumps(manifest, indent=2, sort_keys=True))
+    _atomic_write(MANIFEST_FILE, json.dumps(manifest_snapshot, indent=2, sort_keys=True))
 
 
 def load_state():
@@ -776,7 +787,11 @@ def load_state():
 
 def parse_input(raw):
     """Accept a URL or bare framework name, return the API path (e.g. 'Vision')."""
-    raw = raw.strip().rstrip("/")
+    raw = raw.strip()
+    # Drop any query string or fragment (e.g. "?language=objc", "#topics")
+    # before trimming slashes, so they aren't appended to the .json fetch path
+    # and turned into guaranteed 404s.
+    raw = raw.split("#", 1)[0].split("?", 1)[0].rstrip("/")
     # Full URL: https://developer.apple.com/documentation/vision
     prefix = "https://developer.apple.com/documentation/"
     if raw.lower().startswith(prefix.lower()):
@@ -818,9 +833,13 @@ def main():
         parser.error("--workers must be a positive integer")
 
     api_path = parse_input(args.framework)
+    if not api_path:
+        parser.error("could not determine a framework name from the input")
     FRAMEWORK_API_PATH = api_path
 
-    dir_name = args.output or f"{api_path.lower()}-docs"
+    # Replace path separators so a deep input (e.g. "Vision/VNRequest") yields a
+    # single flat output directory instead of an unexpected nested one.
+    dir_name = args.output or f"{api_path.lower().replace('/', '-')}-docs"
     OUTPUT_DIR = Path(dir_name)
     STATE_FILE = OUTPUT_DIR / "_state.json"
     MANIFEST_FILE = OUTPUT_DIR / "_manifest.json"
@@ -854,8 +873,7 @@ def main():
         # Persist progress even on Ctrl-C or an unexpected error, so a resume
         # recovers everything written so far instead of only the last 50-page
         # checkpoint.
-        with lock:
-            save_state()
+        save_state()
 
     print("\n" + "=" * 60)
     print("CRAWL COMPLETE")
