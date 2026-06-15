@@ -23,7 +23,7 @@ import threading
 import urllib.request
 import urllib.error
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from pathlib import Path
 
 BASE_URL = "https://developer.apple.com/tutorials/data/documentation"
@@ -119,9 +119,9 @@ def render_inline(items):
         elif t == "image":
             parts.append(f"[Image: {item.get('alt', '')}]")
         elif t == "superscript":
-            parts.append(f"^{render_inline(item.get('inlineContent', []))}")
+            parts.append(f"<sup>{render_inline(item.get('inlineContent', []))}</sup>")
         elif t == "subscript":
-            parts.append(f"_{render_inline(item.get('inlineContent', []))}")
+            parts.append(f"<sub>{render_inline(item.get('inlineContent', []))}</sub>")
         elif t == "strikethrough":
             parts.append(f"~~{render_inline(item.get('inlineContent', []))}~~")
         else:
@@ -251,6 +251,9 @@ def render_parameters(section):
         desc = " ".join(
             render_content_block(c).strip() for c in param.get("content", [])
         )
+        # Indent any continuation lines so a multi-line description stays inside
+        # the list item instead of breaking out as a top-level block.
+        desc = desc.replace("\n", "\n  ")
         lines.append(f"- **`{name}`**: {desc}")
     lines.append("")
     return "\n".join(lines)
@@ -262,6 +265,8 @@ def render_possible_values(section):
         name = val.get("name", "")
         desc = " ".join(render_content_block(c).strip() for c in val.get("content", []))
         if desc:
+            # Keep continuation lines indented under the list item.
+            desc = desc.replace("\n", "\n  ")
             lines.append(f"- **`{name}`**: {desc}")
         else:
             lines.append(f"- **`{name}`**")
@@ -652,15 +657,23 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                 queue.append(p)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        while queue:
-            batch = []
-            while queue and len(batch) < workers:
-                batch.append(queue.popleft())
+        # Keep one in-flight task per worker at all times. A per-batch barrier
+        # (submit `workers` pages, then wait for the whole batch before
+        # refilling) leaves workers idle whenever a single page is slow — a
+        # retrying page can block ~100s on backoff plus timeouts — so we refill
+        # continuously as individual futures complete instead.
+        in_flight = {}
 
-            futures = {executor.submit(process_page, path): path for path in batch}
+        def fill():
+            while queue and len(in_flight) < workers:
+                p = queue.popleft()
+                in_flight[executor.submit(process_page, p)] = p
 
-            for future in as_completed(futures):
-                path = futures[future]
+        fill()
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                path = in_flight.pop(future)
                 try:
                     result = future.result()
                 except Exception as e:
@@ -691,6 +704,7 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                         f"  [{count} pages downloaded, ~{len(queue)} in queue]",
                         flush=True,
                     )
+            fill()
 
 
 def _atomic_write(path, text):
