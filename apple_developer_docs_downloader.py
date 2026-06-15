@@ -160,6 +160,11 @@ def render_inline(items):
 
 
 def render_content_block(block, depth=0):
+    # Recurses with render_inline for nested lists/asides/tables. No explicit
+    # depth cap is needed: the input is Apple's own documentation JSON (trusted,
+    # fetched over HTTPS) whose nesting is shallow, and any pathological page
+    # that did exceed the recursion limit is caught per-page in crawl_parallel
+    # and recorded as a failure rather than crashing the whole crawl.
     t = block.get("type", "")
     lines = []
 
@@ -668,7 +673,7 @@ def collect_child_identifiers(data):
 
 
 def process_page(api_path):
-    global page_count, DOC_IDENTIFIER_PREFIX
+    global DOC_IDENTIFIER_PREFIX
 
     data = fetch_json(api_path)
     if not data:
@@ -698,12 +703,13 @@ def process_page(api_path):
     children = collect_child_identifiers(data)
     child_paths = [identifier_to_api_path(ident) for ident in children]
 
-    with lock:
-        page_count += 1
-        manifest[api_path] = entry
-        count = page_count
-
-    return (api_path, child_paths, count)
+    # Return the manifest entry instead of recording it here: the crawl driver
+    # commits it together with this page's children under a single lock, so a
+    # crash can never persist a parent as "done" in the manifest without its
+    # children landing in `visited`. Recording it here (before the driver
+    # enqueued the children) left a window where an interrupt could mark the
+    # parent complete while its subtree was lost on resume.
+    return (api_path, entry, child_paths)
 
 
 def crawl_parallel(start_path, workers, extra_paths=None):
@@ -756,17 +762,26 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                 if result is None:
                     continue
 
-                _, child_paths, count = result
-                print(f"[{count}] {path}", flush=True)
+                api_path_done, entry, child_paths = result
 
+                # Commit the page to the manifest and enqueue its children under
+                # one lock so the two are always persisted together. If the
+                # manifest entry were written before the children were queued, a
+                # crash in between could mark the parent "done" while its subtree
+                # was never rediscovered on resume.
+                #
                 # Dedup on exact-case identifiers (Apple's are canonical); a
                 # lower-cased key would merge two case-distinct symbols and drop
                 # one, and would break case-sensitive resume re-fetches.
                 with lock:
+                    page_count += 1
+                    manifest[api_path_done] = entry
+                    count = page_count
                     for child in child_paths:
                         if child not in visited:
                             visited.add(child)
                             queue.append(child)
+                print(f"[{count}] {path}", flush=True)
 
                 if count % 50 == 0:
                     save_state()
@@ -831,9 +846,12 @@ def load_state():
     global visited, failed, page_count, manifest, DOC_IDENTIFIER_PREFIX, gone
     if STATE_FILE.exists():
         try:
-            state = json.loads(STATE_FILE.read_text())
+            # Read as UTF-8 to match how _atomic_write() writes these files;
+            # Path.read_text() would otherwise use the platform's locale
+            # encoding and corrupt non-ASCII titles/paths on resume.
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             if MANIFEST_FILE.exists():
-                manifest = json.loads(MANIFEST_FILE.read_text())
+                manifest = json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as e:
             print(f"Warning: state file unreadable ({e}); starting a fresh crawl.")
             return False

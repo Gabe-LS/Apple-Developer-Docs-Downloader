@@ -4,7 +4,7 @@ Download any Apple developer documentation framework as organized, readable mark
 
 ## Why
 
-Apple's developer docs are web-only and hard to search offline. This script crawls the entire documentation tree for a framework via Apple's JSON API and converts every page to clean markdown — declarations, parameters, code listings, relationships, and all. No dependencies beyond Python 3. Resumes interrupted downloads automatically.
+Apple's developer docs are web-only and hard to search offline. This script crawls the entire documentation tree for a framework via Apple's JSON API and converts every page to clean markdown — declarations, parameters, code listings, relationships, and all. No dependencies beyond the Python 3.9+ standard library. Resumes interrupted downloads automatically.
 
 ## Quick start
 
