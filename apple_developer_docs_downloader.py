@@ -12,10 +12,12 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 import threading
 import urllib.request
@@ -32,6 +34,11 @@ visited = set()
 failed = []
 manifest = {}
 page_count = 0
+# Case-normalized output path -> the api_path that owns it. Used to detect when
+# two distinct pages resolve to the same file (case-insensitive filesystem or
+# after filename sanitization) so the second one gets a disambiguated name
+# instead of silently overwriting the first.
+allocated_paths = {}
 
 # Set after we fetch the root page and discover the identifier scheme
 DOC_IDENTIFIER_PREFIX = None  # e.g. "doc://Vision/documentation/"
@@ -137,9 +144,13 @@ def render_content_block(block, depth=0):
     elif t == "codeListing":
         lang = block.get("syntax", "swift")
         code = "\n".join(block.get("code", []))
-        lines.append(f"```{lang}")
+        # Pick a fence longer than the longest backtick run in the code so a
+        # snippet that itself contains ``` can't close the block early.
+        longest_run = max((len(r) for r in re.findall(r"`+", code)), default=0)
+        fence = "`" * max(3, longest_run + 1)
+        lines.append(f"{fence}{lang}")
         lines.append(code)
-        lines.append("```")
+        lines.append(fence)
         lines.append("")
     elif t == "unorderedList":
         for item in block.get("items", []):
@@ -492,6 +503,27 @@ def get_output_path(data, api_path):
     return subdir / (last + ".md")
 
 
+def resolve_output_collision(path, api_path):
+    """Ensure distinct pages never share one output file.
+
+    sanitize_filename and case-insensitive filesystems can map two different
+    api_paths to the same file; without this the second write silently
+    overwrites the first. We disambiguate with a short stable hash of the
+    api_path (not a running counter) so the same page always lands on the same
+    file across resumes.
+    """
+    key = str(path).lower()
+    with lock:
+        owner = allocated_paths.get(key)
+        if owner is None or owner == api_path:
+            allocated_paths[key] = api_path
+            return path
+        suffix = hashlib.sha1(api_path.encode("utf-8")).hexdigest()[:8]
+        disambiguated = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
+        allocated_paths[str(disambiguated).lower()] = api_path
+        return disambiguated
+
+
 # ---------------------------------------------------------------------------
 # Identifier handling — discovers the doc:// prefix from the root page
 # ---------------------------------------------------------------------------
@@ -524,9 +556,18 @@ def discover_identifier_prefix(data):
 
 def is_same_framework_identifier(ident):
     """Check if an identifier belongs to the framework we're crawling."""
-    if not DOC_IDENTIFIER_PREFIX:
-        return ident.startswith("doc://")
-    return ident.startswith(DOC_IDENTIFIER_PREFIX)
+    if DOC_IDENTIFIER_PREFIX:
+        return ident.startswith(DOC_IDENTIFIER_PREFIX)
+    # Prefix discovery failed (unexpected root page or API change). Rather than
+    # accepting every doc:// identifier — which would let the crawler wander out
+    # of the requested framework into Apple's heavily cross-linked docs — match
+    # the path segment after /documentation/ against the target framework.
+    if not ident.startswith("doc://") or "/documentation/" not in ident:
+        return False
+    idx = ident.find("/documentation/")
+    after = ident[idx + len("/documentation/") :].lower()
+    fw = (FRAMEWORK_API_PATH or "").lower()
+    return bool(fw) and (after == fw or after.startswith(fw + "/"))
 
 
 def identifier_to_api_path(ident):
@@ -572,7 +613,7 @@ def process_page(api_path):
                 discover_identifier_prefix(data)
 
     md = convert_to_markdown(data, api_path)
-    out_path = get_output_path(data, api_path)
+    out_path = resolve_output_collision(get_output_path(data, api_path), api_path)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(out_path, md)
@@ -653,11 +694,25 @@ def crawl_parallel(start_path, workers, extra_paths=None):
 
 
 def _atomic_write(path, text):
-    # Write to a sibling temp file then os.replace() for an atomic swap, so an
-    # interruption mid-write can't truncate/corrupt the output or resume files.
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    # Write to a uniquely-named sibling temp file then os.replace() for an atomic
+    # swap, so an interruption mid-write can't truncate/corrupt the output or
+    # resume files. The temp name must be unique per call (not a fixed ".tmp"):
+    # two workers can resolve to the same target on a case-insensitive
+    # filesystem, and a shared temp file would let them clobber each other's
+    # bytes before the replace.
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def save_state():
@@ -686,6 +741,12 @@ def load_state():
         failed = state.get("failed", [])
         page_count = state.get("page_count", 0)
         DOC_IDENTIFIER_PREFIX = state.get("identifier_prefix")
+        # Pre-register already-written files so a resumed crawl resolves the same
+        # collisions the same way it did on the first run.
+        for ap, entry in manifest.items():
+            rel = entry.get("file")
+            if rel:
+                allocated_paths[str(OUTPUT_DIR / rel).lower()] = ap
         print(
             f"Resuming: {page_count} pages already downloaded, "
             f"{len(visited)} paths visited"
@@ -773,8 +834,14 @@ def main():
         print(f"Downloading documentation for: {api_path}")
 
     print()
-    crawl_parallel(api_path, args.workers, extra_paths=retry_paths)
-    save_state()
+    try:
+        crawl_parallel(api_path, args.workers, extra_paths=retry_paths)
+    finally:
+        # Persist progress even on Ctrl-C or an unexpected error, so a resume
+        # recovers everything written so far instead of only the last 50-page
+        # checkpoint.
+        with lock:
+            save_state()
 
     print("\n" + "=" * 60)
     print("CRAWL COMPLETE")
