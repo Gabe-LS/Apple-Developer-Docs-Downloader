@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -62,6 +63,10 @@ def fetch_json(path, retry=0):
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         if e.code == 404:
+            # A 404 is a genuinely-missing page, not a failure: Apple's topic
+            # sections cross-link to beta-only or withdrawn symbols. Skip it
+            # quietly rather than recording it in `failed`, which would force a
+            # non-zero exit on most large frameworks.
             return None
         if retry < MAX_RETRIES:
             delay = 2**retry
@@ -73,6 +78,10 @@ def fetch_json(path, retry=0):
             failed.append({"path": path, "error": f"HTTP {e.code}"})
         return None
     except Exception as e:
+        # Retry on any non-HTTP error here, including JSONDecodeError: a
+        # truncated or momentarily-malformed body is usually transient, and a
+        # re-fetch typically returns valid JSON. Genuinely permanent failures
+        # still give up after MAX_RETRIES and are recorded in `failed`.
         if retry < MAX_RETRIES:
             delay = 2**retry
             print(f"  Error for {url}: {e}, retrying in {delay}s...")
@@ -157,18 +166,31 @@ def render_content_block(block, depth=0):
             for i, content in enumerate(item.get("content", [])):
                 rendered = render_content_block(content, depth + 1).rstrip()
                 if i == 0:
-                    lines.append(f"{'  ' * depth}- {rendered}")
+                    indent = "  " * depth
+                    # Indent continuation lines so multi-line content (e.g. a code
+                    # block) stays inside the list item instead of breaking out as
+                    # a top-level block.
+                    rendered = rendered.replace("\n", "\n" + indent + "  ")
+                    lines.append(f"{indent}- {rendered}")
                 else:
-                    lines.append(f"{'  ' * (depth + 1)}{rendered}")
+                    indent = "  " * (depth + 1)
+                    rendered = rendered.replace("\n", "\n" + indent)
+                    lines.append(f"{indent}{rendered}")
         lines.append("")
     elif t == "orderedList":
         for idx, item in enumerate(block.get("items", []), 1):
             for i, content in enumerate(item.get("content", [])):
                 rendered = render_content_block(content, depth + 1).rstrip()
                 if i == 0:
-                    lines.append(f"{'  ' * depth}{idx}. {rendered}")
+                    indent = "  " * depth
+                    # Indent continuation lines so multi-line content stays inside
+                    # the list item instead of breaking out as a top-level block.
+                    rendered = rendered.replace("\n", "\n" + indent + "  ")
+                    lines.append(f"{indent}{idx}. {rendered}")
                 else:
-                    lines.append(f"{'  ' * (depth + 1)}{rendered}")
+                    indent = "  " * (depth + 1)
+                    rendered = rendered.replace("\n", "\n" + indent)
+                    lines.append(f"{indent}{rendered}")
         lines.append("")
     elif t == "aside":
         name = block.get("name", block.get("style", "note")).capitalize()
@@ -762,6 +784,20 @@ def load_state():
         except (json.JSONDecodeError, OSError) as e:
             print(f"Warning: state file unreadable ({e}); starting a fresh crawl.")
             return False
+        # Don't blend state from a different framework into this run: reusing one
+        # --output dir for two frameworks would otherwise merge their visited
+        # sets, manifests, and collision maps. The framework is recorded in state
+        # by save_state(); compare case-insensitively since the CLI arg's case
+        # may differ from the stored canonical name.
+        saved_fw = state.get("framework")
+        if saved_fw and FRAMEWORK_API_PATH and saved_fw.lower() != FRAMEWORK_API_PATH.lower():
+            print(
+                f"Warning: existing state is for '{saved_fw}', not '{FRAMEWORK_API_PATH}'; "
+                "ignoring stale state and starting a fresh crawl.",
+                file=sys.stderr,
+            )
+            manifest = {}
+            return False
         visited = set(state.get("visited", []))
         failed = state.get("failed", [])
         page_count = state.get("page_count", 0)
@@ -831,6 +867,11 @@ def main():
 
     if args.workers < 1:
         parser.error("--workers must be a positive integer")
+    # Cap the worker count: more than this yields no throughput gain against
+    # Apple's API and mainly risks rate-limiting/connection exhaustion, so reject
+    # obvious mistakes (e.g. a stray extra digit) instead of spawning the threads.
+    if args.workers > 64:
+        parser.error("--workers must be 64 or fewer")
 
     api_path = parse_input(args.framework)
     if not api_path:
@@ -866,14 +907,27 @@ def main():
     else:
         print(f"Downloading documentation for: {api_path}")
 
+    def _request_shutdown(signum, frame):
+        raise KeyboardInterrupt
+
+    # Translate SIGTERM (CI cancellation, container stop, `kill`) into the same
+    # KeyboardInterrupt path as Ctrl-C so the try/finally below still runs
+    # save_state(); a bare SIGTERM would otherwise terminate the process
+    # without flushing progress to disk.
+    signal.signal(signal.SIGTERM, _request_shutdown)
+
     print()
     try:
         crawl_parallel(api_path, args.workers, extra_paths=retry_paths)
     finally:
         # Persist progress even on Ctrl-C or an unexpected error, so a resume
         # recovers everything written so far instead of only the last 50-page
-        # checkpoint.
-        save_state()
+        # checkpoint. Guard the write so a failed checkpoint can't mask the
+        # original crawl exception (e.g. KeyboardInterrupt) on its way out.
+        try:
+            save_state()
+        except Exception as e:
+            print(f"  WARNING: failed to save final state: {e}", file=sys.stderr)
 
     print("\n" + "=" * 60)
     print("CRAWL COMPLETE")
