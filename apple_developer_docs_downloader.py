@@ -145,7 +145,17 @@ def render_inline(items):
         elif t == "newTerm":
             parts.append(f"*{render_inline(item.get('inlineContent', []))}*")
         elif t == "link":
-            parts.append(f"[{item.get('title', '')}]({item.get('destination', '')})")
+            title = item.get("title", "")
+            dest = item.get("destination", "")
+            # Emit a real markdown link only for safe schemes (http/https/mailto)
+            # and relative links. Apple's JSON is trusted and fetched over HTTPS,
+            # but a misbehaving proxy or a schema change could surface a
+            # javascript:/data: destination that would become a clickable link in
+            # the rendered docs; fall back to plain text for anything else.
+            if re.match(r"(?i)^(https?:|mailto:|[/#]|[^:]*$)", dest):
+                parts.append(f"[{title}]({dest})")
+            else:
+                parts.append(title)
         elif t == "image":
             parts.append(f"[Image: {item.get('alt', '')}]")
         elif t == "superscript":
@@ -716,7 +726,14 @@ def crawl_parallel(start_path, workers, extra_paths=None):
     global page_count
 
     queue = deque()
-    queue.append(start_path)
+    # On a fresh crawl the root must be fetched to discover children and the
+    # identifier prefix. On resume the root is already in the manifest (its
+    # children were persisted in `visited`), so re-enqueueing it would
+    # needlessly re-fetch the page, double-count it in page_count, and fail an
+    # otherwise-complete offline cache when the network is down. Skip it when
+    # already complete; pending-recovery in main() re-enqueues any real gaps.
+    if start_path not in manifest:
+        queue.append(start_path)
     visited.add(start_path)
 
     if extra_paths:
