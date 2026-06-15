@@ -29,10 +29,19 @@ from pathlib import Path
 
 BASE_URL = "https://developer.apple.com/tutorials/data/documentation"
 MAX_RETRIES = 3
+# Hard cap on a single API response held in memory. Real documentation pages are
+# at most a few MB; this only guards against a misbehaving proxy or wrong URL
+# returning an unbounded stream that would exhaust memory across many workers.
+MAX_RESPONSE_BYTES = 50 * 1024 * 1024
 
 lock = threading.Lock()
 visited = set()
 failed = []
+# Paths that returned HTTP 404 — permanently missing, not transient failures.
+# Tracked separately and persisted so a resumed crawl doesn't re-fetch every
+# known-missing page on each run: they have no manifest entry, so the
+# pending-recovery logic in main() would otherwise re-enqueue them forever.
+gone = set()
 manifest = {}
 page_count = 0
 # Case-normalized output path -> the api_path that owns it. Used to detect when
@@ -60,13 +69,25 @@ def fetch_json(path, retry=0):
             },
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
+            length = resp.headers.get("Content-Length")
+            if length is not None and int(length) > MAX_RESPONSE_BYTES:
+                raise ValueError(f"response too large: {length} bytes")
+            # Read one byte past the cap so a missing or lying Content-Length is
+            # still bounded; reject anything that actually exceeds it.
+            body = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise ValueError("response exceeded size cap")
+            return json.loads(body)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             # A 404 is a genuinely-missing page, not a failure: Apple's topic
             # sections cross-link to beta-only or withdrawn symbols. Skip it
             # quietly rather than recording it in `failed`, which would force a
-            # non-zero exit on most large frameworks.
+            # non-zero exit on most large frameworks. Record it in `gone` so a
+            # resumed crawl can tell a known-missing page (never to be retried)
+            # apart from one merely interrupted before it completed.
+            with lock:
+                gone.add(path)
             return None
         if retry < MAX_RETRIES:
             delay = 2**retry
@@ -545,10 +566,22 @@ def resolve_output_collision(path, api_path):
         if owner is None or owner == api_path:
             allocated_paths[key] = api_path
             return path
-        suffix = hashlib.sha1(api_path.encode("utf-8")).hexdigest()[:8]
-        disambiguated = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
-        allocated_paths[str(disambiguated).lower()] = api_path
-        return disambiguated
+        # First candidate is keyed on a stable hash of api_path so the same page
+        # resolves to the same file across resumes. If that candidate is itself
+        # already owned by a different page (an 8-hex hash collision, or a real
+        # page that happens to carry the "-<hash>" name), keep probing with a
+        # counter so we never hand back an already-allocated path.
+        base_suffix = hashlib.sha1(api_path.encode("utf-8")).hexdigest()[:8]
+        n = 0
+        while True:
+            suffix = base_suffix if n == 0 else f"{base_suffix}-{n}"
+            disambiguated = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
+            dkey = str(disambiguated).lower()
+            existing = allocated_paths.get(dkey)
+            if existing is None or existing == api_path:
+                allocated_paths[dkey] = api_path
+                return disambiguated
+            n += 1
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +798,7 @@ def save_state():
         state = {
             "visited": list(visited),
             "failed": list(failed),
+            "gone": list(gone),
             "page_count": page_count,
             "framework": FRAMEWORK_API_PATH,
             "identifier_prefix": DOC_IDENTIFIER_PREFIX,
@@ -775,7 +809,7 @@ def save_state():
 
 
 def load_state():
-    global visited, failed, page_count, manifest, DOC_IDENTIFIER_PREFIX
+    global visited, failed, page_count, manifest, DOC_IDENTIFIER_PREFIX, gone
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text())
@@ -800,6 +834,7 @@ def load_state():
             return False
         visited = set(state.get("visited", []))
         failed = state.get("failed", [])
+        gone = set(state.get("gone", []))
         page_count = state.get("page_count", 0)
         DOC_IDENTIFIER_PREFIX = state.get("identifier_prefix")
         # Pre-register already-written files so a resumed crawl resolves the same
@@ -896,8 +931,13 @@ def main():
         # leave discovered-but-incomplete pages in `visited` with no manifest
         # entry. Re-enqueue anything visited that never produced a manifest
         # entry, otherwise the resumed crawl silently reports success while
-        # missing those pages.
-        pending = [p for p in visited if p not in manifest and p != api_path]
+        # missing those pages. Exclude `gone` (known 404s): they legitimately
+        # have no manifest entry and must not be re-fetched on every resume.
+        pending = [
+            p
+            for p in visited
+            if p not in manifest and p not in gone and p != api_path
+        ]
         visited.difference_update(pending)
         retry_paths.extend(pending)
         if retry_paths:
