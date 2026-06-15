@@ -13,7 +13,9 @@ Usage:
 
 import argparse
 import json
+import os
 import re
+import sys
 import time
 import threading
 import urllib.request
@@ -60,7 +62,8 @@ def fetch_json(path, retry=0):
             time.sleep(wait)
             return fetch_json(path, retry + 1)
         print(f"  FAILED: HTTP {e.code} for {url}")
-        failed.append({"path": path, "error": f"HTTP {e.code}"})
+        with lock:
+            failed.append({"path": path, "error": f"HTTP {e.code}"})
         return None
     except Exception as e:
         if retry < MAX_RETRIES:
@@ -69,7 +72,8 @@ def fetch_json(path, retry=0):
             time.sleep(wait)
             return fetch_json(path, retry + 1)
         print(f"  FAILED: {e} for {url}")
-        failed.append({"path": path, "error": str(e)})
+        with lock:
+            failed.append({"path": path, "error": str(e)})
         return None
 
 
@@ -169,14 +173,16 @@ def render_content_block(block, depth=0):
             header_cells = []
             for cell in first_row:
                 cell_parts = [render_content_block(c).strip() for c in cell]
-                header_cells.append(" ".join(cell_parts))
+                cell_text = " ".join(cell_parts).replace("\n", " ").replace("|", "\\|")
+                header_cells.append(cell_text)
             lines.append("| " + " | ".join(header_cells) + " |")
             lines.append("| " + " | ".join(["---"] * len(header_cells)) + " |")
             for row in rows[1:]:
                 row_cells = []
                 for cell in row:
                     cell_parts = [render_content_block(c).strip() for c in cell]
-                    row_cells.append(" ".join(cell_parts))
+                    cell_text = " ".join(cell_parts).replace("\n", " ").replace("|", "\\|")
+                    row_cells.append(cell_text)
                 lines.append("| " + " | ".join(row_cells) + " |")
             lines.append("")
     elif t == "termList":
@@ -439,12 +445,21 @@ def sanitize_filename(name):
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
     name = re.sub(r"\s+", "-", name)
     name = name.strip(".-_")
-    return name[:200] if len(name) > 200 else name
+    if not name:
+        return "untitled"
+    # Truncate by UTF-8 byte length, not character count: many filesystems
+    # (APFS, ext4) cap names at 255 bytes and one character can be several bytes.
+    encoded = name.encode("utf-8")
+    if len(encoded) > 200:
+        return encoded[:200].decode("utf-8", "ignore")
+    return name
 
 
 def strip_framework_prefix(api_path):
     """Remove the framework name from the front of an API path."""
-    if FRAMEWORK_API_PATH and api_path.startswith(FRAMEWORK_API_PATH + "/"):
+    # Compare case-insensitively: the framework arg may be lower-case (e.g.
+    # "vision") while Apple's identifiers use canonical case ("Vision/...").
+    if FRAMEWORK_API_PATH and api_path.lower().startswith(FRAMEWORK_API_PATH.lower() + "/"):
         return api_path[len(FRAMEWORK_API_PATH) + 1 :]
     if FRAMEWORK_API_PATH and api_path.lower() == FRAMEWORK_API_PATH.lower():
         return ""
@@ -560,7 +575,7 @@ def process_page(api_path):
     out_path = get_output_path(data, api_path)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(md, encoding="utf-8")
+    _atomic_write(out_path, md)
 
     metadata = data.get("metadata", {})
     title = metadata.get("title", api_path.split("/")[-1])
@@ -587,12 +602,12 @@ def crawl_parallel(start_path, workers, extra_paths=None):
 
     queue = deque()
     queue.append(start_path)
-    visited.add(start_path.lower())
+    visited.add(start_path)
 
     if extra_paths:
         for p in extra_paths:
-            if p.lower() not in visited:
-                visited.add(p.lower())
+            if p not in visited:
+                visited.add(p)
                 queue.append(p)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -609,6 +624,8 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                     result = future.result()
                 except Exception as e:
                     print(f"  ERROR processing {path}: {e}", flush=True)
+                    with lock:
+                        failed.append({"path": path, "error": str(e)})
                     continue
 
                 if result is None:
@@ -617,11 +634,13 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                 _, child_paths, count = result
                 print(f"[{count}] {path}", flush=True)
 
+                # Dedup on exact-case identifiers (Apple's are canonical); a
+                # lower-cased key would merge two case-distinct symbols and drop
+                # one, and would break case-sensitive resume re-fetches.
                 with lock:
                     for child in child_paths:
-                        canonical = child.lower()
-                        if canonical not in visited:
-                            visited.add(canonical)
+                        if child not in visited:
+                            visited.add(child)
                             queue.append(child)
 
                 if count % 50 == 0:
@@ -633,6 +652,14 @@ def crawl_parallel(start_path, workers, extra_paths=None):
                     )
 
 
+def _atomic_write(path, text):
+    # Write to a sibling temp file then os.replace() for an atomic swap, so an
+    # interruption mid-write can't truncate/corrupt the output or resume files.
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def save_state():
     state = {
         "visited": list(visited),
@@ -641,22 +668,24 @@ def save_state():
         "framework": FRAMEWORK_API_PATH,
         "identifier_prefix": DOC_IDENTIFIER_PREFIX,
     }
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    MANIFEST_FILE.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
+    _atomic_write(MANIFEST_FILE, json.dumps(manifest, indent=2, sort_keys=True))
 
 
 def load_state():
     global visited, failed, page_count, manifest, DOC_IDENTIFIER_PREFIX
     if STATE_FILE.exists():
-        state = json.loads(STATE_FILE.read_text())
+        try:
+            state = json.loads(STATE_FILE.read_text())
+            if MANIFEST_FILE.exists():
+                manifest = json.loads(MANIFEST_FILE.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: state file unreadable ({e}); starting a fresh crawl.")
+            return False
         visited = set(state.get("visited", []))
         failed = state.get("failed", [])
         page_count = state.get("page_count", 0)
         DOC_IDENTIFIER_PREFIX = state.get("identifier_prefix")
-        if MANIFEST_FILE.exists():
-            manifest = json.loads(MANIFEST_FILE.read_text())
         print(
             f"Resuming: {page_count} pages already downloaded, "
             f"{len(visited)} paths visited"
@@ -710,6 +739,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.workers < 1:
+        parser.error("--workers must be a positive integer")
+
     api_path = parse_input(args.framework)
     FRAMEWORK_API_PATH = api_path
 
@@ -724,10 +756,17 @@ def main():
     retry_paths = []
     if resumed:
         retry_paths = [f["path"] for f in failed]
-        failed_lc = {p.lower() for p in retry_paths}
-        visited.difference_update(failed_lc)
+        visited.difference_update(retry_paths)
+        # Pages are marked visited when queued, not when written, so a crash can
+        # leave discovered-but-incomplete pages in `visited` with no manifest
+        # entry. Re-enqueue anything visited that never produced a manifest
+        # entry, otherwise the resumed crawl silently reports success while
+        # missing those pages.
+        pending = [p for p in visited if p not in manifest and p != api_path]
+        visited.difference_update(pending)
+        retry_paths.extend(pending)
         if retry_paths:
-            print(f"Retrying {len(retry_paths)} previously failed paths...")
+            print(f"Retrying {len(retry_paths)} failed or incomplete paths...")
         failed.clear()
         print("Continuing from previous state...")
     else:
@@ -749,6 +788,11 @@ def main():
             print(f"  - {f['path']}: {f['error']}")
     print(f"Output directory: {OUTPUT_DIR.resolve()}")
     print(f"Manifest: {MANIFEST_FILE.resolve()}")
+
+    # Signal incomplete crawls to automation: any unrecovered failure, or a run
+    # that downloaded nothing, is not a success.
+    if failed or page_count == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
